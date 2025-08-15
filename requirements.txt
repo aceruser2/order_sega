@@ -1,0 +1,12 @@
+streamlit
+sqlalchemy
+fastapi
+pika
+redis
+psycopg2-binary
+uvicorn
+PyJWT
+passlib
+pydantic[email]
+python-multipart
+bcrypt==4.0.1
