@@ -332,7 +332,7 @@ DATABASE_URL = "postgresql://myuser:mypassword@localhost/restaurant_db"
 
 ```bash
 cd /home/acer/project/order_sega
-python db_migrations.py
+alembic -c alembic.ini upgrade head
 uvicorn backend_main:orchestration_order_service.app --host 0.0.0.0 --port 8002 --reload
 ```
 
@@ -399,11 +399,13 @@ streamlit run front_main.py
 文檔版本：1.0  
 最後更新：2023-12-31
 
-1.菜單圖片上傳代測
-2.顧客暫無信用卡結帳待修
-3.沒有外送,只有內用跟外帶
-4.顧客訂單ui待優化
-5.把print移除,換logging
-6.模組化
-7.測試
-8.未來預計加入庫存限制
+1. 菜單圖片上傳代測 v 
+    The use_column_width parameter has been deprecated and will be removed in a future release. Please utilize the use_container_width parameter instead.
+2. 顧客暫無信用卡結帳待修 v
+3. 沒有外送,只有內用跟外帶 v 但保留頁面
+4. 顧客訂單ui待優化
+5. 把print移除,換logging
+6. 把request改httpx模組
+7. 模組化
+8. 測試
+9. 未來預計加入庫存限制

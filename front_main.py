@@ -1,8 +1,21 @@
 import streamlit as st
-import requests
+import httpx
 import json
 import time
 from datetime import datetime
+import threading
+import logging
+
+try:
+    import websocket  # websocket-client
+except Exception:
+    websocket = None
+
+# logging 設定（前端主要用於開發除錯）
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+)
+logger = logging.getLogger("front_main")
 
 # 後端服務的基礎 URL
 ORDER_SERVICE_URL = "http://localhost:8002"  # Orchestration 模式的 Order Service 端口
@@ -19,35 +32,50 @@ if "username" not in st.session_state:
 if "customer_id" not in st.session_state:
     st.session_state.customer_id = None
 
+# 新增：rerun flag（避免在 callback 內直接呼叫 st.experimental_rerun）
+if "_needs_rerun" not in st.session_state:
+    st.session_state._needs_rerun = False
+
+# 在 session state 儲存通知列表與啟動旗標
+if "ws_notifications" not in st.session_state:
+    st.session_state.ws_notifications = []
+if "ws_thread_started" not in st.session_state:
+    st.session_state.ws_thread_started = False
+
 
 # 輔助函數：處理API請求
-def make_api_request(method, endpoint, data=None, token=None, params=None):
+def make_api_request(method, endpoint, data=None, token=None, params=None, files=None):
     url = f"{ORDER_SERVICE_URL}{endpoint}"
     headers = {}
     if token:
         headers["Authorization"] = f"Bearer {token}"
 
-    # 調試信息
-    print(f"API請求: {method} {url}")
-    print(f"請求標頭: {headers}")
-    print(f"請求參數: {params}")
+    logger.debug("API請求: %s %s", method, url)
+    logger.debug("請求標頭: %s", headers)
+    logger.debug("請求參數: %s", params)
     if data:
-        print(f"請求數據: {data}")
+        logger.debug("請求數據: %s", data)
 
     try:
-        if method == "GET":
-            response = requests.get(url, headers=headers, params=params)
-        elif method == "POST":
-            response = requests.post(url, headers=headers, json=data)
-        elif method == "PUT":
-            response = requests.put(url, headers=headers, json=data)
-        elif method == "DELETE":
-            response = requests.delete(url, headers=headers)
+        # 使用 httpx 同步請求
+        if files:
+            response = httpx.request(
+                method,
+                url,
+                headers=headers,
+                data=data,
+                params=params,
+                files=files,
+                timeout=10.0,
+            )
+        else:
+            response = httpx.request(
+                method, url, headers=headers, json=data, params=params, timeout=10.0
+            )
 
-        # 記錄回應
-        print(f"回應狀態碼: {response.status_code}")
+        logger.debug("回應狀態碼: %s", response.status_code)
         if response.status_code != 200:
-            print(f"回應內容: {response.text}")
+            logger.debug("回應內容: %s", response.text)
 
         if response.status_code == 401:
             st.error("認證失敗，請重新登入")
@@ -57,7 +85,7 @@ def make_api_request(method, endpoint, data=None, token=None, params=None):
             st.session_state.customer_id = None
             return None
         elif response.status_code == 422:
-            print(f"請求參數錯誤: {response.text}")
+            logger.info("請求參數錯誤: %s", response.text)
             error_detail = "請求參數錯誤"
             try:
                 error_data = response.json()
@@ -69,10 +97,11 @@ def make_api_request(method, endpoint, data=None, token=None, params=None):
             return None
 
         return response
-    except requests.exceptions.ConnectionError:
+    except httpx.ConnectError:
         st.error("無法連接到後端服務，請確認服務已啟動")
         return None
     except Exception as e:
+        logger.exception("發生錯誤於 make_api_request")
         st.error(f"發生錯誤: {e}")
         return None
 
@@ -87,13 +116,14 @@ def login_page():
         submit_button = st.form_submit_button(label="登入")
 
         if submit_button:
-            response = requests.post(
+            # 使用 httpx 直接呼叫 token endpoint (表單)
+            token_resp = httpx.post(
                 f"{ORDER_SERVICE_URL}/token",
                 data={"username": username, "password": password},
+                timeout=10.0,
             )
-
-            if response.status_code == 200:
-                token_data = response.json()
+            if token_resp.status_code == 200:
+                token_data = token_resp.json()
                 st.session_state.access_token = token_data["access_token"]
                 st.session_state.role = token_data["role"]
                 st.session_state.username = username
@@ -101,31 +131,34 @@ def login_page():
                 # 如果是顧客，獲取customer_id
                 if token_data["role"] == "customer":
                     try:
-                        user_response = requests.get(
+                        user_response = httpx.get(
                             f"{ORDER_SERVICE_URL}/orchestration/users/me",
                             headers={
                                 "Authorization": f"Bearer {st.session_state.access_token}"
                             },
+                            timeout=10.0,
                         )
-                        print(f"用戶資訊回應: {user_response.status_code}")
-                        print(f"用戶資訊內容: {user_response.text}")
+                        logger.debug("用戶資訊回應: %s", user_response.status_code)
+                        logger.debug("用戶資訊內容: %s", user_response.text)
 
                         if user_response.status_code == 200:
                             user_data = user_response.json()
                             st.session_state.customer_id = user_data.get("customer_id")
-                            print(f"設置顧客ID: {st.session_state.customer_id}")
+                            logger.info("設置顧客ID: %s", st.session_state.customer_id)
                         else:
                             st.warning(
                                 f"無法獲取用戶資料 (狀態碼: {user_response.status_code})"
                             )
                     except Exception as e:
+                        logger.exception("獲取用戶資料時出錯")
                         st.warning(f"獲取用戶資料時出錯: {e}")
 
                 st.success(f"登入成功！歡迎 {username}")
                 st.rerun()
             else:
+                logger.warning("登入失敗: %s", token_resp.text)
                 st.error("登入失敗，請檢查用戶名和密碼")
-                st.error(f"錯誤詳情: {response.text}")
+                st.error(f"錯誤詳情: {token_resp.text}")
 
     with st.expander("沒有帳號？點擊註冊"):
         with st.form("register_form"):
@@ -197,10 +230,9 @@ def menu_page():
                     try:
                         st.image(
                             f"{ORDER_SERVICE_URL}{item['image_url']}",
-                            use_column_width=True,
+                            use_container_width=True,
                         )
                     except:
-                        # 若圖片載入失敗，仍顯示文字內容
                         pass
 
                 with st.container():
@@ -218,7 +250,6 @@ def menu_page():
                             if "cart" not in st.session_state:
                                 st.session_state.cart = []
 
-                            # 檢查項目是否已在購物車中
                             found = False
                             for cart_item in st.session_state.cart:
                                 if cart_item["id"] == item["id"]:
@@ -237,7 +268,7 @@ def menu_page():
                                 )
 
                             st.success(f"已將 {quantity} 份 {item['name']} 加入訂單")
-                            st.rerun()  # 使用新的 API
+                            st.rerun()
     else:
         st.error("無法獲取菜單")
 
@@ -250,7 +281,6 @@ def cart_page():
         st.info("購物車為空")
         return
 
-    # 顯示購物車內容
     total = 0
     for i, item in enumerate(st.session_state.cart):
         col1, col2, col3, col4, col5 = st.columns([3, 2, 2, 1, 1])
@@ -264,7 +294,7 @@ def cart_page():
             )
             if new_qty != item["quantity"]:
                 st.session_state.cart[i]["quantity"] = new_qty
-                st.rerun()  # 使用新的 API
+                st.rerun()
         with col4:
             item_total = item["price"] * item["quantity"]
             st.write(f"${item_total:.2f}")
@@ -272,22 +302,29 @@ def cart_page():
         with col5:
             if st.button("移除", key=f"remove_{i}"):
                 st.session_state.cart.pop(i)
-                st.rerun()  # 使用新的 API
+                st.rerun()
 
     st.markdown("---")
     st.markdown(f"### 總金額: ${total:.2f}")
 
-    # 結帳表單
     with st.form("checkout_form"):
-        delivery_address = st.text_input("配送地址", placeholder="請輸入送餐地址")
-        payment_method = st.selectbox("付款方式", ["cash", "credit_card"])
+        order_type_label = st.selectbox(
+            "訂單類型", ["內用", "外帶"], key="order_type_select"
+        )
+        if order_type_label == "內用":
+            table_number = st.text_input("桌號", placeholder="請輸入桌號")
+        else:
+            table_number = None
+
+        payment_method = "cash"
         checkout_button = st.form_submit_button("確認訂單")
 
         if checkout_button:
-            if not delivery_address:
-                st.error("請填寫配送地址")
+            if order_type_label == "內用" and (
+                not table_number or table_number.strip() == ""
+            ):
+                st.error("內用訂單請填寫桌號")
             else:
-                # 轉換購物車內容為API需要的格式
                 items = []
                 for item in st.session_state.cart:
                     items.append(
@@ -298,11 +335,13 @@ def cart_page():
                         }
                     )
 
-                # 創建訂單
                 order_data = {
                     "customer_id": st.session_state.customer_id,
                     "items": items,
-                    "delivery_address": delivery_address,
+                    "order_type": (
+                        "dine_in" if order_type_label == "內用" else "takeaway"
+                    ),
+                    "table_number": table_number,
                     "payment_method": payment_method,
                 }
 
@@ -317,13 +356,9 @@ def cart_page():
                     order_details = response.json()
                     st.success(f"訂單創建成功！訂單ID: {order_details['order_id']}")
                     st.json(order_details)
-
-                    # 清空購物車
                     st.session_state.cart = []
-
-                    # 刷新頁面
                     time.sleep(2)
-                    st.rerun()  # 使用新的 API
+                    st.rerun()
                 else:
                     error_msg = "訂單創建失敗"
                     if response:
@@ -338,8 +373,7 @@ def cart_page():
 def orders_page():
     st.header("📋 我的訂單")
 
-    # 獲取訂單列表
-    params = None  # 初始化為 None，而不是空字典
+    params = None
     if st.session_state.role == "customer" and st.session_state.customer_id:
         params = {"customer_id": st.session_state.customer_id}
 
@@ -357,9 +391,8 @@ def orders_page():
             st.info("暫無訂單記錄")
             return
 
-        # 顯示訂單列表
         for order in orders:
-            with st.container(border=True):
+            with st.container():
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.write(f"**訂單ID:** {order['order_id']}")
@@ -399,10 +432,17 @@ def orders_page():
                             history = history_response.json()
                             st.subheader("訂單狀態歷史")
                             for status_change in history:
-                                timestamp = datetime.fromisoformat(
-                                    status_change["changed_at"].replace("Z", "+00:00")
-                                )
-                                formatted_time = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+                                try:
+                                    timestamp = datetime.fromisoformat(
+                                        status_change["changed_at"].replace(
+                                            "Z", "+00:00"
+                                        )
+                                    )
+                                    formatted_time = timestamp.strftime(
+                                        "%Y-%m-%d %H:%M:%S"
+                                    )
+                                except Exception:
+                                    formatted_time = status_change.get("changed_at")
                                 st.write(
                                     f"- {formatted_time}: {status_change['status'].upper()}"
                                 )
@@ -421,7 +461,7 @@ def orders_page():
                         if cancel_response and cancel_response.status_code == 200:
                             st.success("訂單已取消")
                             time.sleep(1)
-                            st.rerun()  # 使用新的 API
+                            st.rerun()
                         else:
                             st.error("訂單取消失敗")
     else:
@@ -433,15 +473,12 @@ def payment_confirmation_page():
     st.header("💳 支付確認")
     st.write("此功能僅供店員確認顧客支付。")
 
-    # 獲取訂單列表（pending 狀態）
     response = make_api_request(
         "GET", "/orchestration/orders", token=st.session_state.access_token
     )
 
     if response and response.status_code == 200:
         orders = response.json()
-
-        # 過濾 pending 狀態的訂單
         pending_orders = [order for order in orders if order["status"] == "pending"]
 
         if not pending_orders:
@@ -450,20 +487,32 @@ def payment_confirmation_page():
 
         st.subheader("待確認支付的訂單")
 
-        # 顯示待處理訂單
         for order in pending_orders:
-            with st.container(border=True):
+            with st.container():
                 col1, col2 = st.columns(2)
                 with col1:
                     st.write(f"**訂單ID:** {order['order_id']}")
                     st.write(f"**總金額:** ${order['total_amount']:.2f}")
 
                 with col2:
-                    # 獲取支付信息
-                    payment_id_placeholder = st.empty()
-                    payment_id = st.text_input(
-                        "輸入Payment ID", key=f"payment_{order['order_id']}"
+                    payment_id = None
+                    payment_resp = make_api_request(
+                        "GET",
+                        f"/orchestration/orders/{order['order_id']}/payment",
+                        token=st.session_state.access_token,
                     )
+                    if payment_resp and payment_resp.status_code == 200:
+                        try:
+                            payment_info = payment_resp.json()
+                            payment_id = payment_info.get("payment_id")
+                            st.write(f"系統 Payment ID: {payment_id}")
+                        except:
+                            payment_id = None
+
+                    if not payment_id:
+                        payment_id = st.text_input(
+                            "輸入Payment ID", key=f"payment_{order['order_id']}"
+                        )
 
                     if payment_id:
                         col_success, col_fail = st.columns(2)
@@ -484,7 +533,7 @@ def payment_confirmation_page():
                                 ):
                                     st.success("支付確認成功")
                                     time.sleep(1)
-                                    st.rerun()  # 使用新的 API
+                                    st.rerun()
                                 else:
                                     st.error("支付確認失敗")
 
@@ -502,86 +551,111 @@ def payment_confirmation_page():
                                 if fail_response and fail_response.status_code == 200:
                                     st.success("支付已標記為失敗")
                                     time.sleep(1)
-                                    st.rerun()  # 使用新的 API
+                                    st.rerun()
                                 else:
                                     st.error("操作失敗")
     else:
         st.error("無法獲取訂單列表")
 
 
-# 廚房訂單頁面
+# 廚房訂單頁面（改為卡片 UI 且不在 callback 內直接 rerun）
 def kitchen_orders_page():
-    st.header("🍳 廚房訂單")
+    st.header("🍳 廚房訂單管理")
+    st.write("列出近期廚房訂單。點選「標記完成」可將狀態由 preparing 變更為 ready。")
 
-    # 顯示一個表單來查詢廚房訂單
-    with st.form("kitchen_form"):
-        kitchen_order_id = st.text_input("廚房訂單ID", placeholder="請輸入廚房訂單ID")
-        submit_button = st.form_submit_button("查詢")
+    resp = make_api_request(
+        "GET", "/orchestration/kitchen/orders", token=st.session_state.access_token
+    )
+    if not resp or resp.status_code != 200:
+        st.error("無法獲取廚房訂單列表")
+        return
 
-        if submit_button and kitchen_order_id:
-            response = make_api_request(
-                "GET",
-                f"/orchestration/kitchen/orders/{kitchen_order_id}",
-                token=st.session_state.access_token,
-            )
+    orders = resp.json()
+    if not orders:
+        st.info("暫無廚房訂單")
+        return
 
-            if response and response.status_code == 200:
-                kitchen_order = response.json()
-                st.success("廚房訂單查詢成功")
-
-                st.subheader("廚房訂單詳情")
-                st.write(f"**廚房訂單ID:** {kitchen_order['kitchen_order_id']}")
-                st.write(f"**關聯訂單ID:** {kitchen_order['order_id']}")
-                st.write(f"**狀態:** {kitchen_order['status']}")
-                st.write(f"**預估時間:** {kitchen_order['estimated_time']} 分鐘")
+    # 更整齊的卡片式排列
+    for k in orders:
+        with st.container():
+            left, right = st.columns([3, 1])
+            with left:
+                st.subheader(f"廚房訂單 {k.get('kitchen_order_id')}")
+                st.write(f"關聯訂單: {k.get('order_id')}")
+                status = k.get("status")
+                if status == "preparing":
+                    st.warning(f"狀態：{status.upper()} 🔧")
+                elif status == "received":
+                    st.info(f"狀態：{status.upper()}")
+                elif status == "ready":
+                    st.success(f"狀態：{status.upper()} ✅")
+                else:
+                    st.write(f"狀態：{status}")
 
                 try:
-                    items = json.loads(kitchen_order["items"])
-                    st.subheader("訂單項目")
-                    for item in items:
-                        st.write(
-                            f"- {item['name']} x {item['quantity']} (${item['price']:.2f} 每份)"
+                    items = json.loads(k.get("items") or "[]")
+                    if items:
+                        st.write("項目：")
+                        for it in items:
+                            st.write(
+                                f"- {it.get('name')} x {it.get('quantity')} (${it.get('price')})"
+                            )
+                except Exception:
+                    st.write("無法解析訂單項目")
+            with right:
+                st.write(f"建立時間：{k.get('created_at')}")
+                # 只在 preparing 顯示標記完成按鈕
+                if k.get("status") == "preparing":
+                    if st.button(
+                        "標記完成", key=f"complete_{k.get('kitchen_order_id')}"
+                    ):
+                        resp_complete = make_api_request(
+                            "POST",
+                            f"/orchestration/kitchen/orders/{k.get('kitchen_order_id')}/complete",
+                            token=st.session_state.access_token,
                         )
-                except:
-                    st.write("無法顯示訂單項目")
-            else:
-                st.error("廚房訂單查詢失敗")
+                        if resp_complete and resp_complete.status_code == 200:
+                            st.success("標記完成")
+                            # 不直接呼叫 st.experimental_rerun()，改為設定 flag
+                            st.session_state._needs_rerun = True
+                        else:
+                            st.error("標記完成失敗")
 
 
-# 配送訂單頁面
+# 配送訂單頁面（改為列出近期配送單）
 def delivery_page():
     st.header("🚚 配送訂單")
+    st.write("顯示近期配送單（如無配送流程則此頁僅供檢視）。")
 
-    # 顯示一個表單來查詢配送訂單
-    with st.form("delivery_form"):
-        delivery_id = st.text_input("配送ID", placeholder="請輸入配送ID")
-        submit_button = st.form_submit_button("查詢")
+    resp = make_api_request(
+        "GET", "/orchestration/delivery/orders", token=st.session_state.access_token
+    )
 
-        if submit_button and delivery_id:
-            response = make_api_request(
-                "GET",
-                f"/orchestration/delivery/orders/{delivery_id}",
-                token=st.session_state.access_token,
-            )
+    if not resp or resp.status_code != 200:
+        st.error("無法獲取配送訂單列表")
+        return
 
-            if response and response.status_code == 200:
-                delivery_order = response.json()
-                st.success("配送訂單查詢成功")
+    deliveries = resp.json()
+    if not deliveries:
+        st.info("暫無配送單")
+        return
 
-                st.subheader("配送訂單詳情")
-                st.write(f"**配送ID:** {delivery_order['delivery_id']}")
-                st.write(f"**關聯訂單ID:** {delivery_order['order_id']}")
-                st.write(f"**狀態:** {delivery_order['status']}")
-                st.write(f"**司機ID:** {delivery_order['driver_id'] or '尚未分配'}")
-            else:
-                st.error("配送訂單查詢失敗")
+    for d in deliveries:
+        with st.container():
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.write(f"**配送ID:** {d.get('delivery_id')}")
+                st.write(f"**關聯訂單ID:** {d.get('order_id')}")
+                st.write(f"**地址:** {d.get('address')}")
+                st.write(f"**狀態:** {d.get('status')}")
+                st.write(f"**司機:** {d.get('driver_id') or '尚未分配'}")
+            with col2:
+                st.write(f"建立時間：{d.get('created_at')}")
 
 
 # 菜單管理頁面 (店員和管理員)
 def menu_admin_page():
     st.header("🍽️ 菜單管理")
-
-    # 顯示當前用戶角色與令牌
     st.write(f"當前用戶: {st.session_state.username}, 角色: {st.session_state.role}")
 
     if st.session_state.role not in ["staff", "admin"]:
@@ -590,7 +664,6 @@ def menu_admin_page():
 
     tab1, tab2, tab3 = st.tabs(["查看菜單", "新增菜單項", "編輯菜單"])
 
-    # 查看菜單
     with tab1:
         response = make_api_request("GET", "/orchestration/menu/items")
         if response and response.status_code == 200:
@@ -627,7 +700,6 @@ def menu_admin_page():
         else:
             st.error("無法獲取菜單")
 
-    # 新增菜單項（使用表單，確保按鈕穩定顯示）
     with tab2:
         st.subheader("新增菜單項")
         with st.form("add_menu_form"):
@@ -649,7 +721,6 @@ def menu_admin_page():
                 if not new_name:
                     st.error("請輸入菜品名稱")
                 else:
-                    # 使用 multipart/form-data 發送（file + form fields）
                     url = f"{ORDER_SERVICE_URL}/orchestration/menu/admin/items"
                     headers = {}
                     if st.session_state.access_token:
@@ -663,10 +734,8 @@ def menu_admin_page():
                         "description": new_description or "",
                     }
 
-                    files = None
                     try:
                         if new_image is not None:
-                            # new_image 是 Streamlit UploadedFile，讀取 bytes
                             files = {
                                 "image": (
                                     new_image.name,
@@ -674,27 +743,33 @@ def menu_admin_page():
                                     new_image.type,
                                 )
                             }
-                            response = requests.post(
-                                url, data=data, files=files, headers=headers
+                            response = make_api_request(
+                                "POST",
+                                "/orchestration/menu/admin/items",
+                                data=data,
+                                token=st.session_state.access_token,
+                                files=files,
                             )
                         else:
-                            # 沒有檔案的情況仍以 form-data 發送（requests 會自動處理）
-                            response = requests.post(url, data=data, headers=headers)
-
-                        if response.status_code in (200, 201):
-                            st.success("菜單項新增成功")
-                            time.sleep(1)
-                            st.rerun()
-                        else:
-                            try:
-                                err = response.json()
-                            except:
-                                err = response.text
-                            st.error(f"菜單項新增失敗: {response.status_code} {err}")
+                            response = make_api_request(
+                                "POST",
+                                "/orchestration/menu/admin/items",
+                                data=data,
+                                token=st.session_state.access_token,
+                            )
                     except Exception as e:
-                        st.error(f"請求過程中出錯: {e}")
+                        response = None
+                    if response and response.status_code in (200, 201):
+                        st.success("菜單項新增成功")
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        try:
+                            err = response.json()
+                        except:
+                            err = response.text
+                        st.error(f"菜單項新增失敗: {response.status_code} {err}")
 
-    # 編輯菜單（若無項目提供快速新增）
     with tab3:
         response = make_api_request("GET", "/orchestration/menu/items")
         if response and response.status_code == 200:
@@ -742,11 +817,12 @@ def menu_admin_page():
         )
 
         if selected_item:
-            # 顯示現有圖片
             if selected_item.get("image_url"):
                 try:
                     st.image(
-                        f"{ORDER_SERVICE_URL}{selected_item['image_url']}", width=200
+                        f"{ORDER_SERVICE_URL}{selected_item['image_url']}",
+                        use_container_width=False,
+                        width=200,
                     )
                 except:
                     pass
@@ -802,33 +878,39 @@ def menu_admin_page():
                                         edit_image.type,
                                     )
                                 }
-                                response = requests.put(
-                                    url, data=data, files=files, headers=headers
+                                response = make_api_request(
+                                    "PUT",
+                                    f"/orchestration/menu/admin/items/{selected_item['id']}",
+                                    data=data,
+                                    token=st.session_state.access_token,
+                                    files=files,
                                 )
                             else:
-                                response = requests.put(url, data=data, headers=headers)
+                                response = make_api_request(
+                                    "PUT",
+                                    f"/orchestration/menu/admin/items/{selected_item['id']}",
+                                    data=data,
+                                    token=st.session_state.access_token,
+                                )
+                        except Exception:
+                            response = None
 
-                            if response.status_code in (200, 201):
-                                st.success("菜單項更新成功")
-                                time.sleep(1)
-                                st.rerun()
-                            else:
-                                try:
-                                    err = response.json()
-                                except:
-                                    err = response.text
-                                st.error(
-                                    f"菜單項更新失敗: {response.status_code} {err}"
-                                )
-                        except Exception as e:
-                            st.error(f"更新過程中出錯: {e}")
+                        if response and response.status_code in (200, 201):
+                            st.success("菜單項更新成功")
+                            time.sleep(1)
+                            st.rerun()
+                        else:
+                            try:
+                                err = response.json()
+                            except:
+                                err = response.text
+                            st.error(f"菜單項更新失敗: {response.status_code} {err}")
 
 
 # 顧客管理頁面 (只有店員和管理員)
 def customer_management_page():
     st.header("👥 顧客管理")
 
-    # 獲取顧客列表 - 修復權限問題
     response = make_api_request(
         "GET", "/orchestration/customers", token=st.session_state.access_token
     )
@@ -840,9 +922,8 @@ def customer_management_page():
             st.info("暫無顧客資料")
             return
 
-        # 顯示顧客列表
         for customer in customers:
-            with st.container(border=True):
+            with st.container():
                 col1, col2, col3 = st.columns(3)
                 with col1:
                     st.write(f"**姓名:** {customer['name']}")
@@ -850,16 +931,50 @@ def customer_management_page():
                     st.write(f"**顧客ID:** {customer['customer_id']}")
                 with col3:
                     st.write(f"**電子郵件:** {customer['email']}")
-
                 if customer.get("phone"):
                     st.write(f"**電話:** {customer['phone']}")
     else:
         st.error("無法獲取顧客資料")
 
 
+# WebSocket 客戶端相關
+def _start_ws_client(token: str):
+    """在背景 thread 啟動 websocket-client 並將通知 append 到 st.session_state.ws_notifications"""
+    if websocket is None:
+        logger.info("websocket-client not installed; 無法啟動 WS 客戶端")
+        return
+
+    def on_message(ws, message):
+        try:
+            data = json.loads(message)
+            if "ws_notifications" not in st.session_state:
+                st.session_state.ws_notifications = []
+            st.session_state.ws_notifications.append(data)
+        except Exception:
+            logger.exception("WS on_message 處理失敗")
+
+    def on_error(ws, error):
+        logger.error("WS error: %s", error)
+
+    def on_close(ws, close_status_code, close_msg):
+        logger.info("WS closed: %s %s", close_status_code, close_msg)
+
+    def on_open(ws):
+        logger.info("WS connected")
+
+    url = f"ws://localhost:8002/ws/notifications?token={token}"
+    ws_app = websocket.WebSocketApp(
+        url,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close,
+        on_open=on_open,
+    )
+    ws_app.run_forever()
+
+
 # 主界面
 def main():
-    # 側邊欄：登入狀態和導航
     with st.sidebar:
         st.title("🍽️ 餐廳訂單系統")
 
@@ -871,13 +986,11 @@ def main():
 
             st.markdown("---")
 
-            # 顯示導航選項 (根據用戶角色)
             pages = ["查看菜單"]
 
             if st.session_state.role == "customer":
                 pages.extend(["購物車", "我的訂單"])
 
-            # 確保管理員也能訪問菜單管理等功能
             if st.session_state.role in ["staff", "admin"]:
                 pages.extend(
                     [
@@ -890,10 +1003,8 @@ def main():
                     ]
                 )
 
-            # 給 radio 指定唯一 key，避免重複元件 ID 問題
             selected_page = st.radio("導航", pages, key="sidebar_nav")
 
-            # 顯示用戶詳細信息 (便於調試)
             with st.expander("用戶詳細信息"):
                 st.write(f"用戶名: {st.session_state.username}")
                 st.write(f"角色: {st.session_state.role}")
@@ -919,11 +1030,9 @@ def main():
             st.info("請先登入")
             selected_page = "登入"
 
-    # 主內容區域
     if not st.session_state.access_token:
         login_page()
     else:
-        # 根據選擇的頁面顯示不同內容
         if selected_page == "查看菜單":
             menu_page()
         elif selected_page == "購物車":
@@ -941,8 +1050,28 @@ def main():
         elif selected_page == "顧客管理":
             customer_management_page()
 
+        # 在主流程末端（非 callback）統一處理 rerun
+        if st.session_state.get("_needs_rerun", False):
+            # 重置 flag 並在主流程呼叫 rerun（此處是在 streamlit 腳本的主線程）
+            st.session_state._needs_rerun = False
+            st.rerun()
+
+        # 當店員登入且尚未啟動 WS thread 時啟動
+        if st.session_state.access_token and st.session_state.role in [
+            "staff",
+            "admin",
+        ]:
+            if not st.session_state.ws_thread_started:
+                try:
+                    threading.Thread(
+                        target=_start_ws_client,
+                        args=(st.session_state.access_token,),
+                        daemon=True,
+                    ).start()
+                    st.session_state.ws_thread_started = True
+                except Exception as e:
+                    st.warning(f"啟動 WS 客戶端失敗: {e}")
+
 
 if __name__ == "__main__":
-    # 開發時可以取消以下註釋來啟用調試頁面
-    # debug_session()
     main()
